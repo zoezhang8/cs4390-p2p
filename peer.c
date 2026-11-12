@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -168,9 +169,9 @@ static void save_tracker_file(const char *cmd, const char *reply)
            ts_now(), peer_name, track_name, path);
     /* Download code starts here */
     if (download_file(path, shared_dir, my_ip, my_port,
-                      tracker_ip, tracker_port, DL_DEFAULT_THREADS) == 0)
+                      tracker_ip, tracker_port, DL_DEFAULT_THREADS) == 0) {
         printf("%s %s: download of %s complete, MD5 verified\n", ts_now(), peer_name, track_name);
-    else
+    } else
         printf("%s %s: download of %s FAILED\n", ts_now(), peer_name, track_name);
 }
 
@@ -292,6 +293,44 @@ static void *server_thread(void *arg)
     return NULL;
 }
 
+/* Periodic updatetracker (spec: every n seconds, n = last line of clientThreadConfig.cfg).
+ * For each complete file in the shared folder, tell the tracker this peer still has
+ * bytes 0..filesize. Files still downloading (their tracker file is still in cache/)
+ * are skipped: the download code reports their progress after each segment. */
+static void *updater_thread(void *arg)
+{
+    (void)arg;
+    while (1) {
+        sleep((unsigned)update_interval);
+
+        DIR *d = opendir(shared_dir);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;              /* skip . .. and hidden files */
+
+            char path[512], cached[512];
+            struct stat st;
+            snprintf(path, sizeof path, "%s/%s", shared_dir, e->d_name);
+            if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) continue;
+
+            snprintf(cached, sizeof cached, "%s/%s.track", CACHE_DIR, e->d_name);
+            if (access(cached, F_OK) == 0) continue;        /* still downloading */
+
+            char cmd[MAXLINE];
+            snprintf(cmd, sizeof cmd, "updatetracker %s 0 %lld %s %d",
+                     e->d_name, (long long)st.st_size, my_ip, my_port);
+            char *reply = tracker_request(cmd);
+            if (reply) {
+                printf("%s %s: periodic %s -> %s", ts_now(), peer_name, cmd, reply);
+                free(reply);
+            }
+        }
+        closedir(d);
+    }
+    return NULL;
+}
+
 static void print_help(void)
 {
     printf("Commands:\n"
@@ -328,6 +367,12 @@ int main(void)
         fprintf(stderr, "Cannot start server thread\n");
         return 1;
     }
+
+    pthread_t upd;                       /* periodic updatetracker every update_interval s */
+    if (pthread_create(&upd, NULL, updater_thread, NULL) != 0)
+        fprintf(stderr, "Cannot start updater thread\n");
+    else
+        pthread_detach(upd);
 
     print_help();
     char line[MAXLINE];
