@@ -1,0 +1,14 @@
+# compiled programs (spec: no compiled files in submission)
+tracker
+peer1/peer
+peer2/peer
+peer3/peer
+*.o
+# runtime data
+torrents/
+peer*/shared/
+peer*/cache/
+logs/
+# misc
+.DS_Store
+*.pdf
