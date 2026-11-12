@@ -1,4 +1,5 @@
 #include "common.h"
+#include "download.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +167,17 @@ static void save_tracker_file(const char *cmd, const char *reply)
     printf("%s %s: tracker file %s received, MD5 OK, saved to %s\n",
            ts_now(), peer_name, track_name, path);
     /* Download code starts here */
+    if (download_file(path, shared_dir, my_ip, my_port,
+                      tracker_ip, tracker_port, DL_DEFAULT_THREADS) == 0)
+        printf("%s %s: download of %s complete, MD5 verified\n", ts_now(), peer_name, track_name);
+    else
+        printf("%s %s: download of %s FAILED\n", ts_now(), peer_name, track_name);
+}
+
+/* Required by download.c */
+int dl_compute_md5(const char *path, char out_hex[33])
+{
+    return md5_file(path, out_hex);
 }
 
 /* share <filename> <description>: build and send createtracker for a shared file. */

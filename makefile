@@ -11,8 +11,8 @@ all: tracker peers
 tracker: tracker.c common.c common.h
 	$(CC) $(CFLAGS) -o tracker tracker.c common.c $(LDLIBS)
 
-peers: peer.c common.c common.h
-	for p in $(PEERS); do mkdir -p $$p && $(CC) $(CFLAGS) -o $$p/peer peer.c common.c $(LDLIBS); done
+peers: peer.c common.c common.h download.c download.h
+	for p in $(PEERS); do mkdir -p $$p && $(CC) $(CFLAGS) -o $$p/peer peer.c common.c download.c $(LDLIBS); done
 
 clean:
 	rm -f tracker $(addsuffix /peer,$(PEERS))
