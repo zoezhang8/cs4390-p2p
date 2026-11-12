@@ -1,305 +1,348 @@
 /*
- * tracker.c - multithreaded tracker server for the CS4390 P2P file sharing project.
+ * tracker.c - P2P tracker server.
+ * Each connection gets a detached thread that serves one request and closes.
  *
- * The main thread accepts connections; each connection is handed to a new worker
- * thread (pthreads) that serves exactly one request (LIST, GET, createtracker or
- * updatetracker), sends the reply and closes the connection.
- *
- * Config file "sconfig":  line 1 = listen port
- *                         line 2 = shared directory for .track files (e.g. torrents)
- *                         line 3 = peer timeout in seconds (optional, default 900);
- *                                  entries older than this are removed as dead peers
+ * sconfig: port, tracker folder (default "torrents"),
+ *          dead-peer timeout in seconds (default 900).
  */
+
 #include "common.h"
 
-#include <arpa/inet.h>
-#include <dirent.h>
-#include <netinet/in.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
-#include <time.h>
+#include <errno.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
 
-static char torrent_dir[256] = "torrents";
-static long peer_timeout = 900;
-static int  worker_count = 0;                    /* numbers worker threads in the log */
-static pthread_mutex_t file_lock  = PTHREAD_MUTEX_INITIALIZER; /* guards .track files */
-static pthread_mutex_t count_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SCONFIG       "sconfig"
+#define PEER_TIMEOUT  900    /* default dead-peer timeout (s) */
 
-typedef struct { int fd; int id; char ip[64]; } worker_arg;
+char tracker_folder[512] = "torrents";
+long dead_timeout = PEER_TIMEOUT;
 
-/* One peer line of a tracker file: ip:port:start:end:timestamp */
-typedef struct { char ip[64]; int port; long start, end, ts; } peer_entry;
+/* Serializes all tracker-file access */
+pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Parsed tracker file */
-typedef struct {
-    char filename[256], description[512], md5[64];
-    long filesize;
-    int npeers;
-    peer_entry peers[MAX_PEERS];
-} tracker_file;
-
-/* Reject names that could escape the torrents directory. */
-static int valid_name(const char *name)
+/* Send <updatetracker filename status> */
+static void update_reply(int sock, const char *filename, const char *status)
 {
-    return name[0] != '\0' && name[0] != '.' && strchr(name, '/') == NULL;
+    char reply[512];
+    snprintf(reply, sizeof reply, "<updatetracker %s %s>\n", filename, status);
+    send_str(sock, reply);
 }
 
-static void track_path(const char *filename, char *out, size_t max)
+/* Non-hidden file ending in ".track" */
+static int is_track_file(const char *name)
 {
-    snprintf(out, max, "%s/%s.track", torrent_dir, filename);
+    size_t len = strlen(name);
+    return len > 6 && name[0] != '.' && strcmp(name + len - 6, ".track") == 0;
 }
 
-/* Parse a .track file. Lines starting with '#' are comments. Returns 0 on success. */
-static int load_tracker(const char *path, tracker_file *t)
+/* Reject empty names and paths that could leave the tracker folder */
+static int bad_name(const char *name)
 {
-    FILE *f = fopen(path, "r");
-    char line[MAXLINE];
-    if (!f) return -1;
-    memset(t, 0, sizeof *t);
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '#' || line[0] == '\0') continue;
-        if (!strncmp(line, "Filename:", 9))         sscanf(line + 9, " %255s", t->filename);
-        else if (!strncmp(line, "Filesize:", 9))    t->filesize = atol(line + 9);
-        else if (!strncmp(line, "Description:", 12)) snprintf(t->description, sizeof t->description, "%s", line + 13);
-        else if (!strncmp(line, "MD5:", 4))         sscanf(line + 4, " %63s", t->md5);
-        else if (t->npeers < MAX_PEERS) {
-            peer_entry *p = &t->peers[t->npeers];
-            if (sscanf(line, " %63[^:]:%d:%ld:%ld:%ld", p->ip, &p->port, &p->start, &p->end, &p->ts) == 5)
-                t->npeers++;
-        }
-    }
-    fclose(f);
-    return 0;
+    return name[0] == '\0' || strchr(name, '/') != NULL || strstr(name, "..") != NULL;
 }
 
-/* Write a tracker file in the format required by the spec. */
-static int save_tracker(const char *path, const tracker_file *t)
+/* Reply: <REP LIST X>, one <i name size md5> per tracker file, <REP LIST END> */
+static void handle_list_req(int s)
 {
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    fprintf(f, "Filename: %s\nFilesize: %ld\nDescription: %s\nMD5: %s\n#list of peers follows next\n",
-            t->filename, t->filesize, t->description, t->md5);
-    for (int i = 0; i < t->npeers; i++)
-        fprintf(f, "%s:%d:%ld:%ld:%ld\n", t->peers[i].ip, t->peers[i].port,
-                t->peers[i].start, t->peers[i].end, t->peers[i].ts);
-    return fclose(f) == 0 ? 0 : -1;
-}
-
-/* LIST: <REP LIST X> / <i name size md5> ... / <REP LIST END> */
-static void handle_list(int fd, int id)
-{
+    char line[MAXLINE], name[256], md5[64];
+    char path[1024];
+    long size;
+    int count = 0, i = 1;
     DIR *d;
     struct dirent *e;
-    char path[512], names[256][256];
-    tracker_file t;
-    int n = 0;
+    FILE *fp;
 
     pthread_mutex_lock(&file_lock);
-    if ((d = opendir(torrent_dir)) != NULL) {
-        while ((e = readdir(d)) != NULL && n < 256) {
-            size_t len = strlen(e->d_name);
-            if (len > 6 && !strcmp(e->d_name + len - 6, ".track"))
-                snprintf(names[n++], 256, "%s", e->d_name);
+
+    /* Count first so X can be sent up front */
+    if ((d = opendir(tracker_folder)) != NULL) {
+        while ((e = readdir(d)) != NULL)
+            if (is_track_file(e->d_name)) count++;
+        closedir(d);
+    }
+    snprintf(line, sizeof line, "<REP LIST %d>\n", count);
+    send_str(s, line);
+
+    /* Fields come from each file's header */
+    if ((d = opendir(tracker_folder)) != NULL) {
+        while ((e = readdir(d)) != NULL) {
+            if (!is_track_file(e->d_name)) continue;
+            snprintf(path, sizeof path, "%s/%s", tracker_folder, e->d_name);
+            if ((fp = fopen(path, "r")) == NULL) continue;
+
+            name[0] = md5[0] = '\0';
+            size = 0;
+            while (fgets(line, sizeof line, fp) != NULL) {
+                if (line[0] == '#') continue;
+                if (strncmp(line, "Filename:", 9) == 0) sscanf(line + 9, " %255s", name);
+                if (strncmp(line, "Filesize:", 9) == 0) sscanf(line + 9, " %ld", &size);
+                if (strncmp(line, "MD5:", 4) == 0)      sscanf(line + 4, " %63s", md5);
+            }
+            fclose(fp);
+            snprintf(line, sizeof line, "<%d %s %ld %s>\n", i++, name, size, md5);
+            send_str(s, line);
         }
         closedir(d);
     }
-    char line[MAXLINE];
-    snprintf(line, sizeof line, "<REP LIST %d>\n", n);
-    send_str(fd, line);
-    for (int i = 0; i < n; i++) {
-        snprintf(path, sizeof path, "%s/%s", torrent_dir, names[i]);
-        if (load_tracker(path, &t) == 0) {
-            snprintf(line, sizeof line, "<%d %s %ld %s>\n", i + 1, t.filename, t.filesize, t.md5);
-            send_str(fd, line);
-        }
-    }
-    pthread_mutex_unlock(&file_lock);
-    send_str(fd, "<REP LIST END>\n");
-    printf("%s [worker %d] LIST request served (%d tracker files)\n", ts_now(), id, n);
-}
-
-/* GET filename.track: <REP GET BEGIN> / content / <REP GET END md5-of-content> */
-static void handle_get(int fd, int id, const char *arg)
-{
-    char name[256], path[512], md5[33], line[128];
-    if (sscanf(arg, "%255s", name) != 1 || !valid_name(name)) {
-        send_str(fd, "<GET invalid>\n");
-        return;
-    }
-    snprintf(path, sizeof path, "%s/%s", torrent_dir, name);
-
-    pthread_mutex_lock(&file_lock);
-    FILE *f = fopen(path, "rb");
-    char *buf = NULL;
-    long len = 0;
-    if (f) {
-        fseek(f, 0, SEEK_END); len = ftell(f); rewind(f);
-        buf = malloc((size_t)len + 1);
-        if (buf && fread(buf, 1, (size_t)len, f) != (size_t)len) { free(buf); buf = NULL; }
-        fclose(f);
-    }
     pthread_mutex_unlock(&file_lock);
 
-    if (!buf) {
-        send_str(fd, "<GET invalid>\n");
-        printf("%s [worker %d] GET %s failed: no such tracker file\n", ts_now(), id, name);
-        return;
-    }
-    md5_buf((unsigned char *)buf, (size_t)len, md5);
-    send_str(fd, "<REP GET BEGIN>\n");
-    write_all(fd, buf, (size_t)len);
-    snprintf(line, sizeof line, "<REP GET END %s>\n", md5);
-    send_str(fd, line);
-    free(buf);
-    printf("%s [worker %d] GET %s served (%ld bytes)\n", ts_now(), id, name, len);
+    send_str(s, "<REP LIST END>\n");
+    printf("%s LIST request served (%d tracker files)\n", ts_now(), count);
 }
 
-/* createtracker filename filesize description md5 ip port */
-static void handle_create(int fd, int id, const char *arg)
+/* Reply: <REP GET BEGIN>, file bytes, <REP GET END md5>. The MD5 covers the bytes sent. */
+static void handle_get_req(int s, const char *f)
 {
-    tracker_file t;
-    char path[512];
-    memset(&t, 0, sizeof t);
-    t.npeers = 1;
-    peer_entry *p = &t.peers[0];
-    if (sscanf(arg, "%255s %ld %511s %63s %63s %d", t.filename, &t.filesize, t.description,
-               t.md5, p->ip, &p->port) != 6 || !valid_name(t.filename) || t.filesize < 0) {
-        send_str(fd, "<createtracker fail>\n");
-        printf("%s [worker %d] createtracker failed: malformed message\n", ts_now(), id);
+    const char *notfound = "<REP GET END 0>\n";   /* sent on any failure */
+    char path[1024], md5[33], end[64];
+    FILE *fp;
+    long size;
+    unsigned char *data;
+
+    if (bad_name(f)) {
+        send_str(s, notfound);
         return;
     }
-    p->start = 0; p->end = t.filesize; p->ts = time(NULL);
-    track_path(t.filename, path, sizeof path);
+    snprintf(path, sizeof path, "%s/%s", tracker_folder, f);
 
+    /* Read the whole file under the lock */
     pthread_mutex_lock(&file_lock);
-    struct stat st;
-    const char *reply;
-    if (stat(path, &st) == 0)              reply = "<createtracker ferr>\n";
-    else if (save_tracker(path, &t) != 0)  reply = "<createtracker fail>\n";
-    else                                   reply = "<createtracker succ>\n";
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        pthread_mutex_unlock(&file_lock);
+        send_str(s, notfound);
+        printf("%s GET %s: not found\n", ts_now(), f);
+        return;
+    }
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    rewind(fp);
+    data = malloc(size > 0 ? (size_t)size : 1);
+    if (data == NULL || (size > 0 && fread(data, 1, (size_t)size, fp) != (size_t)size)) {
+        fclose(fp);
+        pthread_mutex_unlock(&file_lock);
+        free(data);
+        send_str(s, notfound);
+        return;
+    }
+    fclose(fp);
     pthread_mutex_unlock(&file_lock);
 
-    send_str(fd, reply);
-    printf("%s [worker %d] createtracker %s from %s:%d -> %.*s\n", ts_now(), id, t.filename,
-           p->ip, p->port, (int)strlen(reply) - 3, reply + 1);
+    md5_buf(data, (size_t)size, md5);
+
+    send_str(s, "<REP GET BEGIN>\n");
+    write_all(s, data, (size_t)size);
+    snprintf(end, sizeof end, "<REP GET END %s>\n", md5);
+    send_str(s, end);
+    free(data);
+    printf("%s GET %s served (%ld bytes)\n", ts_now(), f, size);
 }
 
-/* updatetracker filename start end ip port */
-static void handle_update(int fd, int id, const char *arg)
+/* createtracker filename filesize description md5 ip port
+ * Creates <filename>.track. Replies succ, ferr (already exists), or fail. */
+static void handle_createtracker_req(int sock, const char *msg)
 {
-    char name[256], ip[64], path[512], reply[400];
-    long start, end, now = time(NULL);
-    int port;
-    tracker_file t;
+    char cmd[64], filename[256] = "", desc[256], md5[64], ip[64] = "", path[1024];
+    long filesize = 0;
+    int port = 0;
+    const char *reply, *status;
+    FILE *fp;
 
-    if (sscanf(arg, "%255s %ld %ld %63s %d", name, &start, &end, ip, &port) != 5 || !valid_name(name)) {
-        send_str(fd, "<updatetracker unknown fail>\n");
-        return;
-    }
-    track_path(name, path, sizeof path);
-
-    pthread_mutex_lock(&file_lock);
-    if (load_tracker(path, &t) != 0) {
-        snprintf(reply, sizeof reply, "<updatetracker %s ferr>\n", name);
+    if (sscanf(msg, "%63s %255s %ld %255s %63s %63s %d",
+               cmd, filename, &filesize, desc, md5, ip, &port) != 7 ||
+        bad_name(filename) || filesize < 0 || port <= 0) {
+        status = "fail";
     } else {
-        /* Drop dead peers (no update within peer_timeout), then update or add this peer. */
-        int k = 0, found = 0;
-        for (int i = 0; i < t.npeers; i++) {
-            peer_entry *p = &t.peers[i];
-            if (!strcmp(p->ip, ip) && p->port == port) {
-                p->start = start; p->end = end; p->ts = now; found = 1;
-            } else if (now - p->ts > peer_timeout) {
-                printf("%s [worker %d] removing dead peer %s:%d from %s\n", ts_now(), id, p->ip, p->port, name);
+        snprintf(path, sizeof path, "%s/%s.track", tracker_folder, filename);
+        pthread_mutex_lock(&file_lock);
+        fp = fopen(path, "wx");   /* fails if the file exists */
+        if (fp == NULL) {
+            status = (errno == EEXIST) ? "ferr" : "fail";
+        } else {
+            fprintf(fp, "Filename: %s\n", filename);
+            fprintf(fp, "Filesize: %ld\n", filesize);
+            fprintf(fp, "Description: %s\n", desc);
+            fprintf(fp, "MD5: %s\n", md5);
+            fprintf(fp, "#list of peers follows next\n");
+            /* Seed has the whole file: ip:port:start:end:timestamp */
+            fprintf(fp, "%s:%d:0:%ld:%ld\n", ip, port, filesize, (long)time(NULL));
+            fclose(fp);
+            status = "succ";
+        }
+        pthread_mutex_unlock(&file_lock);
+    }
+    reply = !strcmp(status, "succ") ? "<createtracker succ>\n"
+          : !strcmp(status, "ferr") ? "<createtracker ferr>\n" : "<createtracker fail>\n";
+    send_str(sock, reply);
+    printf("%s createtracker %s from %s:%d -> %s\n",
+           ts_now(), filename[0] ? filename : "?", ip[0] ? ip : "?", port, status);
+}
+
+/* updatetracker filename start_byte end_byte ip port
+ * Adds or refreshes the peer and drops dead peers. Replies succ, ferr (no file), or fail. */
+static void handle_updatetracker_req(int s, const char *msg)
+{
+    char line[MAXLINE], cmd[64], filename[256] = "", ip[64];
+    char range_start[64], range_end[64];
+    char path[1024], tmp[1040];
+    char pip[64], prs[64], pre[64];
+    int port, pport, in_peer_section = 0, replaced = 0, dropped = 0;
+    long now, pts;
+    FILE *fp, *out;
+
+    if (sscanf(msg, "%63s %255s %63s %63s %63s %d",
+               cmd, filename, range_start, range_end, ip, &port) != 6 || bad_name(filename)) {
+        update_reply(s, filename, "fail");
+        return;
+    }
+
+    /* Write changes to a temp file, then rename it over the original */
+    snprintf(path, sizeof path, "%s/%s.track", tracker_folder, filename);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+
+    pthread_mutex_lock(&file_lock);
+    if ((fp = fopen(path, "r")) == NULL) {
+        pthread_mutex_unlock(&file_lock);
+        update_reply(s, filename, "ferr");
+        printf("%s updatetracker %s: no such tracker file\n", ts_now(), filename);
+        return;
+    }
+    if ((out = fopen(tmp, "w")) == NULL) {
+        fclose(fp);
+        pthread_mutex_unlock(&file_lock);
+        update_reply(s, filename, "fail");
+        return;
+    }
+
+    now = (long)time(NULL);
+
+    while (fgets(line, sizeof line, fp) != NULL) {
+        if (line[0] == '#') {          /* peer list starts after this line */
+            in_peer_section = 1;
+            fputs(line, out);
+            continue;
+        }
+        if (!in_peer_section) {
+            fputs(line, out);
+            continue;
+        }
+        /* Peer line: ip:port:start:end:timestamp */
+        if (sscanf(line, " %63[^:]:%d:%63[^:]:%63[^:]:%ld", pip, &pport, prs, pre, &pts) == 5) {
+            if (strcmp(pip, ip) == 0 && pport == port) {   /* this peer: refresh */
+                if (!replaced) {
+                    fprintf(out, "%s:%d:%s:%s:%ld\n", ip, port, range_start, range_end, now);
+                    replaced = 1;
+                }
                 continue;
             }
-            t.peers[k++] = *p;
+            if (now - pts > dead_timeout) {   /* dead peer: drop */
+                dropped++;
+                continue;
+            }
         }
-        t.npeers = k;
-        if (!found && t.npeers < MAX_PEERS) {
-            peer_entry *p = &t.peers[t.npeers++];
-            snprintf(p->ip, sizeof p->ip, "%s", ip);
-            p->port = port; p->start = start; p->end = end; p->ts = now;
-            found = 1;
-        }
-        snprintf(reply, sizeof reply, "<updatetracker %s %s>\n", name,
-                 (found && save_tracker(path, &t) == 0) ? "succ" : "fail");
+        fputs(line, out);   /* keep live peers and unparsed lines */
+    }
+    if (!replaced)   /* new peer */
+        fprintf(out, "%s:%d:%s:%s:%ld\n", ip, port, range_start, range_end, now);
+
+    fclose(fp);
+    if (fclose(out) != 0 || rename(tmp, path) != 0) {
+        remove(tmp);
+        pthread_mutex_unlock(&file_lock);
+        update_reply(s, filename, "fail");
+        return;
     }
     pthread_mutex_unlock(&file_lock);
 
-    send_str(fd, reply);
-    printf("%s [worker %d] updatetracker %s %ld-%ld from %s:%d -> %.*s\n", ts_now(), id, name,
-           start, end, ip, port, (int)strlen(reply) - 3, reply + 1);
+    update_reply(s, filename, "succ");
+    printf("%s updatetracker %s %s-%s from %s:%d -> succ%s\n", ts_now(), filename,
+           range_start, range_end, ip, port, dropped ? " (dead peers removed)" : "");
 }
 
-/* Worker thread: serve exactly one request, then close the connection. */
-static void *worker(void *argp)
+/* Serve one request, then close the connection. */
+static void *handle_client(void *arg)
 {
-    worker_arg *a = argp;
-    char msg[MAXLINE];
+    int sock = *(int *)arg;
+    char msg[MAXLINE], first[64] = "", second[64] = "", fname[256] = "";
+    free(arg);
 
-    printf("%s [worker %d] started for connection from %s\n", ts_now(), a->id, a->ip);
-    if (read_line(a->fd, msg, sizeof msg) > 0) {
-        strip_message(msg);
-        if (!strcasecmp(msg, "REQ LIST"))                 handle_list(a->fd, a->id);
-        else if (!strncasecmp(msg, "GET ", 4))             handle_get(a->fd, a->id, msg + 4);
-        else if (!strncasecmp(msg, "createtracker ", 14))  handle_create(a->fd, a->id, msg + 14);
-        else if (!strncasecmp(msg, "updatetracker ", 14))  handle_update(a->fd, a->id, msg + 14);
-        else {
-            send_str(a->fd, "<invalid command>\n");
-            printf("%s [worker %d] unknown command: %s\n", ts_now(), a->id, msg);
+    if (read_line(sock, msg, sizeof msg) > 0) {
+        strip_message(msg);                        /* < > are optional */
+        sscanf(msg, "%63s %63s", first, second);
+
+        if (strcasecmp(first, "REQ") == 0 && strcasecmp(second, "LIST") == 0) {
+            handle_list_req(sock);
+        } else if (strcasecmp(first, "GET") == 0) {
+            sscanf(msg, "%*s %255s", fname);
+            handle_get_req(sock, fname);
+        } else if (strcasecmp(first, "createtracker") == 0) {
+            handle_createtracker_req(sock, msg);
+        } else if (strcasecmp(first, "updatetracker") == 0) {
+            handle_updatetracker_req(sock, msg);
+        } else {
+            printf("%s unknown command ignored: %s\n", ts_now(), msg);
         }
     }
-    close(a->fd);
-    free(a);
+    close(sock);
     return NULL;
 }
 
 int main(void)
 {
-    char buf[256];
-    int port;
+    char line[MAXLINE];
+    int port, lfd;
 
-    signal(SIGPIPE, SIG_IGN);                    /* a peer hanging up must not kill us */
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    if (config_line("sconfig", 1, buf, sizeof buf) != 0 || (port = atoi(buf)) <= 0) {
-        fprintf(stderr, "Cannot read port from sconfig\n");
+    setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffered output */
+    signal(SIGPIPE, SIG_IGN);           /* don't die if a peer disconnects early */
+
+    if (config_line(SCONFIG, 1, line, sizeof line) != 0 || (port = atoi(line)) <= 0) {
+        fprintf(stderr, "%s: line 1 must be the tracker port\n", SCONFIG);
         return 1;
     }
-    if (config_line("sconfig", 2, buf, sizeof buf) == 0 && buf[0]) snprintf(torrent_dir, sizeof torrent_dir, "%s", buf);
-    if (config_line("sconfig", 3, buf, sizeof buf) == 0 && atol(buf) > 0) peer_timeout = atol(buf);
-    mkdir(torrent_dir, 0755);
+    if (config_line(SCONFIG, 2, line, sizeof line) == 0 && line[0] != '\0')
+        snprintf(tracker_folder, sizeof tracker_folder, "%.511s", line);
+    if (config_line(SCONFIG, 3, line, sizeof line) == 0 && atol(line) > 0)
+        dead_timeout = atol(line);
 
-    int lfd = listen_on(port);
-    if (lfd < 0) { perror("tracker: bind/listen failed"); return 1; }
-    printf("Tracker SERVER READY on port %d (shared dir: %s/, peer timeout %lds)\n", port, torrent_dir, peer_timeout);
+    if (mkdir(tracker_folder, 0777) != 0 && errno != EEXIST) {
+        perror("mkdir");
+        return 1;
+    }
 
-    for (;;) {
-        struct sockaddr_in cli;
-        socklen_t clen = sizeof cli;
-        int cfd = accept(lfd, (struct sockaddr *)&cli, &clen);
-        if (cfd < 0) { perror("tracker: accept"); continue; }
+    if ((lfd = listen_on(port)) < 0) {
+        fprintf(stderr, "Tracker cannot listen on port %d: %s\n", port, strerror(errno));
+        return 1;
+    }
+    printf("%s Tracker ready on port %d (folder %s/, dead peer timeout %lds)\n",
+           ts_now(), port, tracker_folder, dead_timeout);
 
-        worker_arg *a = malloc(sizeof *a);
-        if (!a) { close(cfd); continue; }
-        a->fd = cfd;
-        inet_ntop(AF_INET, &cli.sin_addr, a->ip, sizeof a->ip);
-        pthread_mutex_lock(&count_lock);
-        a->id = ++worker_count;
-        pthread_mutex_unlock(&count_lock);
+    while (1) {
+        int fd = accept(lfd, NULL, NULL);
+        if (fd < 0) continue;
+
+        int *arg = malloc(sizeof(int));
+        if (arg == NULL) { close(fd); continue; }
+        *arg = fd;
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, worker, a) != 0) {
-            perror("tracker: pthread_create");
-            close(cfd); free(a);
-            continue;
+        if (pthread_create(&tid, NULL, handle_client, arg) != 0) {
+            printf("%s cannot create worker thread\n", ts_now());
+            close(fd);
+            free(arg);
+        } else {
+            pthread_detach(tid);
         }
-        pthread_detach(tid);                     /* worker cleans up after itself */
     }
 }
